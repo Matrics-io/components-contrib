@@ -23,11 +23,13 @@ import (
 	"math"
 	"net/http"
 	"net/textproto"
+	"os"
 	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 	"time"
+	"sync"
 
 	"github.com/open-policy-agent/opa/rego"
 
@@ -37,21 +39,117 @@ import (
 	"github.com/dapr/kit/logger"
 	kitmd "github.com/dapr/kit/metadata"
 	kitstrings "github.com/dapr/kit/strings"
+
+	// added by 91
+	"github.com/open-policy-agent/opa/loader"
+	"github.com/open-policy-agent/opa/storage/inmem"
+
+	// "github.com/open-policy-agent/opa/compile"
+	"archive/tar"
+	"compress/gzip"
+	"path/filepath"
 )
 
 type Status int
 
+// modified by 91
 type middlewareMetadata struct {
 	Rego                          string   `json:"rego" mapstructure:"rego"`
+	RegoFilePath                  string   `json:"regoFilePath,omitempty" mapstructure:"regoFilePath"`
+	OdrlPolicyDirPath             string   `json:"odrlPolicyDirPath,omitempty" mapstructure:"odrlPolicyDirPath"`
+	UseRegoFile                   bool     `json:"useRegoFile,omitempty" mapstructure:"useRegoFile"`
+	UseRegoBundle                 bool     `json:"useRegoBundle,omitempty" mapstructure:"useRegoBundle"`
+	RegoBundleURL                 string   `json:"regoBundleURL,omitempty" mapstructure:"regoBundleURL"`
+	UseOdrlFiles                  bool     `json:"useOdrlFiles,omitempty" mapstructure:"useOdrlFiles"`
 	DefaultStatus                 Status   `json:"defaultStatus,omitempty" mapstructure:"defaultStatus"`
 	IncludedHeaders               string   `json:"includedHeaders,omitempty" mapstructure:"includedHeaders"`
 	ReadBody                      string   `json:"readBody,omitempty" mapstructure:"readBody"`
 	internalIncludedHeadersParsed []string `json:"-" mapstructure:"-"`
 }
 
+// added by 91
+func downloadFile(url, filepath string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to download file: %w", err)
+	}
+	defer resp.Body.Close()
+
+	out, err := os.Create(filepath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %w", err)
+	}
+	defer out.Close()
+
+	_, err = io.Copy(out, resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to write file: %w", err)
+	}
+
+	return nil
+}
+
+// added by 91
+func extractTarGz(gzipPath, targetDir string) error {
+	file, err := os.Open(gzipPath)
+	if err != nil {
+		return fmt.Errorf("failed to open archive: %w", err)
+	}
+	defer file.Close()
+
+	gzr, err := gzip.NewReader(file)
+	if err != nil {
+		return fmt.Errorf("failed to create gzip reader: %w", err)
+	}
+	defer gzr.Close()
+
+	tarReader := tar.NewReader(gzr)
+
+	for {
+		header, err := tarReader.Next()
+		if err == io.EOF {
+			break // end of archive
+		}
+		if err != nil {
+			return fmt.Errorf("failed to read tar entry: %w", err)
+		}
+
+		targetPath := filepath.Join(targetDir, header.Name)
+		fmt.Println(targetPath)
+
+		switch header.Typeflag {
+		case tar.TypeDir:
+			if err := os.MkdirAll(targetPath, os.FileMode(header.Mode)); err != nil {
+				return fmt.Errorf("failed to create directory: %w", err)
+			}
+		case tar.TypeReg:
+			if err := os.MkdirAll(filepath.Dir(targetPath), 0755); err != nil {
+				return fmt.Errorf("failed to create parent directory: %w", err)
+			}
+			outFile, err := os.Create(targetPath)
+			if err != nil {
+				return fmt.Errorf("failed to create file: %w", err)
+			}
+			if _, err := io.Copy(outFile, tarReader); err != nil {
+				outFile.Close()
+				return fmt.Errorf("failed to write file: %w", err)
+			}
+			outFile.Close()
+		default:
+			return fmt.Errorf("unsupported file type %v in archive", header.Typeflag)
+		}
+	}
+
+	return nil
+}
+
 // NewMiddleware returns a new Open Policy Agent middleware.
 func NewMiddleware(logger logger.Logger) middleware.Middleware {
 	return &Middleware{logger: logger}
+}
+
+func init() {
+	fmt.Println("Hello from init function inside middleware.go")
 }
 
 // Middleware is an OPA  middleware.
@@ -108,25 +206,187 @@ func (s *Status) Valid() bool {
 	return s != nil && *s >= 100 && *s < 600
 }
 
-// GetHandler returns the HTTP handler provided by the middleware.
+// func loadBundle(bundlePath string) error {
+//     result, err := loader.NewFileLoader().AsBundle(bundlePath)
+//     if err != nil {
+//         return fmt.Errorf("failed to load bundle: %w", err)
+//     }
+//     store := inmem.NewFromObject(result.Data)
+//     ctx := context.Background()
+//     moduleOptions := []func(*rego.Rego){
+//         rego.Store(store),
+//         rego.Query("data.example.allow"), // Change to your rule
+//     }
+//     for name, module := range result.Modules {
+//         nameStr := fmt.Sprintf("%v", name)
+//         moduleOptions = append(moduleOptions, rego.Module(nameStr, string(module.Raw)))
+//     }
+//     r := rego.New(moduleOptions...)
+//     policyQuery, err = r.PrepareForEval(ctx)
+//     if err != nil {
+//         return fmt.Errorf("failed to prepare rego query: %w", err)
+//     }
+//     return nil
+// }
+
 func (m *Middleware) GetHandler(parentCtx context.Context, metadata middleware.Metadata) (func(next http.Handler) http.Handler, error) {
+	fmt.Println("hello from GetHandler")
+	fmt.Println("hello again from GetHandler")
+
 	meta, err := m.getNativeMetadata(metadata)
 	if err != nil {
 		return nil, err
 	}
 
-	ctx, cancel := context.WithTimeout(parentCtx, time.Minute)
-	query, err := rego.New(
-		rego.Query("result = data.http.allow"),
-		rego.Module("inline.rego", meta.Rego),
-	).PrepareForEval(ctx)
-	cancel()
-	if err != nil {
-		return nil, err
+	ctx, _ := context.WithTimeout(parentCtx, time.Minute)
+
+	var policyModule string
+	var policyData map[string]interface{}
+	var r *rego.Rego
+
+	var (
+		query   rego.PreparedEvalQuery
+		queryMu sync.RWMutex
+	)
+
+	if meta.UseRegoFile {
+		if meta.UseRegoBundle {
+			refresh := func() error {
+				downloadPath := "/tmp/file.tar.gz"
+				extractPath := "/tmp/extracted"
+
+				if err := downloadFile(meta.RegoBundleURL, downloadPath); err != nil {
+					fmt.Printf("Download failed: %v\n", err)
+					return err
+				}
+
+				if err := extractTarGz(downloadPath, extractPath); err != nil {
+					fmt.Printf("Extraction failed: %v\n", err)
+					return err
+				}
+
+				result, err := loader.NewFileLoader().AsBundle(extractPath)
+				if err != nil {
+					fmt.Printf("failed to load bundle: %v\n", err)
+					return err
+				}
+				store := inmem.NewFromObject(result.Data)
+				moduleOptions := []func(*rego.Rego){
+					rego.Store(store),
+					rego.Query("result = data.http.allow"),
+				}
+				for name, module := range result.Modules {
+					nameStr := fmt.Sprintf("%v", name)
+					moduleOptions = append(moduleOptions, rego.Module(nameStr, string(module.Raw)))
+				}
+				r = rego.New(moduleOptions...)
+				newQuery, err := r.PrepareForEval(context.Background())
+				if err != nil {
+					return err
+				}
+				queryMu.Lock()
+				query = newQuery
+				queryMu.Unlock()
+				return nil
+			}
+
+			if err := refresh(); err != nil {
+				return nil, err
+			}
+
+			go func() {
+				ticker := time.NewTicker(5 * time.Second)
+				defer ticker.Stop()
+				for range ticker.C {
+					if err := refresh(); err != nil {
+						fmt.Printf("bundle refresh failed: %v\n", err)
+					}
+				}
+			}()
+		} else if meta.UseOdrlFiles {
+			fmt.Println("using an odrl policy directory")
+			files, err := os.ReadDir(meta.OdrlPolicyDirPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to read ODRL policy directory: %w", err)
+			}
+
+			policies := make(map[string]interface{})
+
+			for _, file := range files {
+				if file.IsDir() {
+					continue
+				}
+				name := file.Name()
+				fmt.Println(name)
+				if !strings.HasSuffix(name, ".json") {
+					continue
+				}
+				prefix := strings.SplitN(name, ".", 2)[0]
+				content, readErr := os.ReadFile(filepath.Join(meta.OdrlPolicyDirPath, name))
+				if readErr != nil {
+					return nil, fmt.Errorf("failed to read ODRL file %s: %w", name, readErr)
+				}
+				var odrlPolicy map[string]interface{}
+				if err := json.Unmarshal(content, &odrlPolicy); err != nil {
+					return nil, fmt.Errorf("failed to parse ODRL file %s: %w", name, err)
+				}
+				policies[prefix] = odrlPolicy
+				fmt.Println(odrlPolicy)
+			}
+
+			policyData = map[string]interface{}{
+				"policies": policies,
+			}
+			content, readErr := os.ReadFile(meta.RegoFilePath)
+			if readErr != nil {
+				return nil, fmt.Errorf("failed to read Rego file from %s: %w", meta.RegoFilePath, readErr)
+			}
+			policyModule = string(content)
+			fmt.Println("preparing rego query, using ODRL")
+			store := inmem.NewFromObject(policyData)
+			r = rego.New(
+				rego.Query("result = data.http.allow"),
+				rego.Module("policy.rego", policyModule),
+				rego.Store(store),
+			)
+			query, err = r.PrepareForEval(ctx)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			fmt.Println("using a rego file")
+			content, readErr := os.ReadFile(meta.RegoFilePath)
+			if readErr != nil {
+				return nil, fmt.Errorf("failed to read Rego file from %s: %w", meta.RegoFilePath, readErr)
+			}
+			policyModule = string(content)
+			fmt.Println(policyModule)
+			fmt.Println("preparing rego query, NOT using ODRL")
+			r = rego.New(
+				rego.Query("result = data.http.allow"),
+				rego.Module("policy.rego", policyModule),
+			)
+			query, err = r.PrepareForEval(ctx)
+			if err != nil {
+				return nil, err
+			}
+		}
+	} else {
+		policyModule = meta.Rego
+		r = rego.New(
+			rego.Query("result = data.http.allow"),
+			rego.Module("policy.rego", policyModule),
+		)
+		query, err = r.PrepareForEval(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			queryMu.RLock()
+			defer queryMu.RUnlock()
 			if allow := m.evalRequest(w, r, meta, &query); !allow {
 				return
 			}
@@ -134,6 +394,8 @@ func (m *Middleware) GetHandler(parentCtx context.Context, metadata middleware.M
 		})
 	}, nil
 }
+
+
 
 func (m *Middleware) evalRequest(w http.ResponseWriter, r *http.Request, meta *middlewareMetadata, query *rego.PreparedEvalQuery) bool {
 	headers := map[string]string{}
@@ -148,12 +410,21 @@ func (m *Middleware) evalRequest(w http.ResponseWriter, r *http.Request, meta *m
 	if kitstrings.IsTruthy(meta.ReadBody) {
 		buf, _ := io.ReadAll(r.Body)
 		body = string(buf)
-
-		// Put the body back in the request
-		r.Body = io.NopCloser(bytes.NewBuffer(buf))
+		r.Body = io.NopCloser(bytes.NewBuffer(buf)) // Reset body for downstream
 	}
 
 	pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+
+	// Parse user roles from header
+	roleHeader := r.Header.Get("X-User-Roles")
+	var roles []string
+	if roleHeader != "" {
+		roles = strings.Split(roleHeader, ",")
+		for i := range roles {
+			roles[i] = strings.TrimSpace(roles[i])
+		}
+	}
+
 	input := map[string]interface{}{
 		"request": map[string]interface{}{
 			"method":     r.Method,
@@ -165,6 +436,10 @@ func (m *Middleware) evalRequest(w http.ResponseWriter, r *http.Request, meta *m
 			"scheme":     r.URL.Scheme,
 			"body":       body,
 		},
+
+		"user_roles": roles,
+		"resource":   r.URL.String(), // full path (e.g., /hello)
+		"action":     "use",          // static or dynamic
 	}
 
 	results, err := query.Eval(r.Context(), rego.EvalInput(input))
