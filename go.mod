@@ -1,4 +1,4 @@
-module github.com/matrics-io/components-contrib
+module github.com/Matrics-io/components-contrib
 
 go 1.24.1
 
